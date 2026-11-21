@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Flibusta Download Manager 2.5.6
+// @name         Flibusta Download Manager 2.5.7
 // @namespace    http://tampermonkey.net/
-// @version      2.5.6
+// @version      2.5.7
 // @description  Batch books with original server filenames by default; optional readable names, remembered folder, retry and resume.
 // @author       Flibusta multidownload contributors; revised edition
 // @license      GPL-3.0-or-later
@@ -28,6 +28,7 @@
  *
  * Security model: no external dependencies or telemetry; only pages matched
  * above; all remote text is shown via textContent, never via innerHTML.
+ * Image src comes only from parseBookInfo (same-site address).
  * A saved queue stores book URLs/titles locally in Tampermonkey storage.
  *
  * Downloads may redirect from a Flibusta page URL to a separate file
@@ -44,7 +45,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.5.6';
+  const VERSION = '2.5.7';
   const SETTINGS_KEY = 'fdm2:settings';
   const COLLAPSED_KEY = 'fdm2:collapsed';
   const FOLDER_DB = 'FlibustaDownloadManager';
@@ -83,6 +84,9 @@
   const LIST_CACHE_INDEX = 'fdm2:list-index';
   const LIST_CACHE_MS = 86400000; // раскрытые списки автора/серии живут сутки
   const LIST_CACHE_MAX = 40;
+  const BOOK_CACHE_PREFIX = 'fdm2:book:';
+  const BOOK_CACHE_INDEX = 'fdm2:book-index';
+  const BOOK_CACHE_MAX = 200;
   const SUB_LIMIT = 50; // столько книг раскрытого списка показывается сразу
   const REDIRECT_OFF_KEY = 'fdm2:manual-redirect-off';
   const REDIRECT_RETRY_MS = 7 * 86400000; // через неделю ручной режим пробуется снова
@@ -171,7 +175,7 @@
     nativeMaster: null,
     bookBoxes: [],
     onlyRecord: null, // книга, которую качает кнопка «⬇» в строке рейтинга или раскрытом списке
-    seriesCache: new Map(),
+    bookInfoCache: new Map(), // id -> промис BookInfo: повторы и параллельные клики не бьют по хранилищу и сети
     selectedMode: isBook ? 'all' : 'checked',
     bookCount: 0,
     doneTimes: [] // моменты завершения последних книг — для оценки «осталось»
@@ -420,7 +424,7 @@
   }
 
   function validStoredState(value) {
-    return value && ['2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.4.1', '2.4.2', '2.5.0', '2.5.1', '2.5.2', '2.5.3', '2.5.4', '2.5.5', VERSION].includes(value.version) && value.key === PAGE_KEY &&
+    return value && ['2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.4.1', '2.4.2', '2.5.0', '2.5.1', '2.5.2', '2.5.3', '2.5.4', '2.5.5', '2.5.6', VERSION].includes(value.version) && value.key === PAGE_KEY &&
       Array.isArray(value.jobs) && value.jobs.length <= MAX_BOOKS &&
       value.jobs.every(job => job && ['queued', 'active', 'done', 'failed', 'skipped'].includes(job.status) &&
         typeof job.url === 'string' && !!sameSiteURL(job.url) &&
@@ -564,7 +568,10 @@
     style.textContent = '.fdm-row-tools{margin-left:10px;white-space:nowrap}.fdm-row-btn{margin-left:4px;padding:0 7px;border:1px solid #cfd9d5;' +
       'border-radius:6px;background:#f5f8f6;color:#196b59;font:12px/20px sans-serif;cursor:pointer}.fdm-row-btn:hover{background:#e9f4ef}' +
       '.fdm-row-btn:disabled{color:#617370;cursor:default}.fdm-sub{margin:4px 0 8px 24px;padding:0;list-style:none}' +
-      '.fdm-sub li{margin:2px 0}.fdm-sub-note{color:#617370;font-size:12px;margin-left:4px}';
+      '.fdm-sub li{margin:2px 0}.fdm-sub-note{color:#617370;font-size:12px;margin-left:4px}' +
+      '.fdm-info{margin:4px 0 8px 24px;font-size:13px}.fdm-info::after{content:"";display:block;clear:both}' +
+      '.fdm-info p{margin:4px 0}.fdm-info-cover{float:left;max-width:140px;max-height:200px;margin:0 10px 4px 0}' +
+      '.fdm-info-meta{color:#617370;font-size:12px}.fdm-reviews{margin-top:6px;border-top:1px solid #cfd9d5}.fdm-review{margin:6px 0}';
     document.head.append(style);
     // Строка списка — <li>, строка таблицы «Оценённых» — первая ячейка <tr>.
     for (const row of main.querySelectorAll('li, tr')) {
@@ -603,6 +610,7 @@
         ctx.buttons[kind] = btn;
         tools.append(btn);
       }
+      tools.append(addInfoToggle(id, cell, ctx.sub));
       cell.prepend(box, ' ');
       cell.append(tools, ctx.sub);
       rows.push(row0);
@@ -626,17 +634,150 @@
     try { await prepare('checked'); } finally { runtime.onlyRecord = null; }
   }
 
-  /** Адрес страницы серии книги (первая ссылка /s/<id> на странице книги) или null. Запоминается на время страницы. */
+  /** Адрес страницы серии книги или null: берётся из сведений о книге (кэш общий с «+ описание»). */
   async function seriesURLFor(id) {
-    if (runtime.seriesCache.has(id)) return runtime.seriesCache.get(id);
-    const html = await httpGetText(new URL('/b/' + id, locationURL.origin).href);
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const root = doc.querySelector('#main') || doc;
-    const found = [...root.querySelectorAll('a[href]')].map(a => sameSiteURL(a.getAttribute('href'), location.href))
+    return (await bookInfo(id)).series;
+  }
+
+  /**
+   * @typedef {{ cover: string|null, annotation: string[], genres: string[], year: string, size: string,
+   *   rating: string, series: string|null, reviews: { who: string, when: string, text: string[] }[] }} BookInfo
+   */
+  /** Сведения со страницы книги /b/<id>: только текст и адреса этого же сайта, разметка сайта не переносится. */
+  function parseBookInfo(doc) {
+    const root = doc.querySelector('#main') || doc.body;
+    const clean = s => s.replace(/\s+/g, ' ').trim();
+    // обложка и серия — только адреса этого же сайта
+    const coverImg = [...root.querySelectorAll('img')].find(img => img.getAttribute('alt') === 'Cover image');
+    const coverURL = coverImg ? sameSiteURL(coverImg.getAttribute('src') || '', location.href) : null;
+    const seriesURL = [...root.querySelectorAll('a[href]')]
+      .map(a => sameSiteURL(a.getAttribute('href') || '', location.href))
       .find(url => url && SERIES_PATH.test(url.pathname));
-    const result = found ? found.href : null;
-    runtime.seriesCache.set(id, result);
-    return result;
+    // аннотация: абзацы после заголовка до ближайшего разделителя
+    const heading = [...root.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Аннотация');
+    const annotation = [];
+    for (let el = heading ? heading.nextElementSibling : null; el; el = el.nextElementSibling) {
+      if (['HR', 'H2', 'FORM'].includes(el.tagName)) break;
+      if (el.tagName === 'P' && el.textContent.trim()) annotation.push(el.textContent.trim());
+    }
+    const genres = [...root.querySelectorAll('a.genre')].map(a => a.textContent.trim()).filter(Boolean);
+    const year = (root.textContent.match(/издание\s+(\d{4})\s*г/) || [])[1] || '';
+    const size = root.querySelector('span[style="size"]')?.textContent.trim() || '';
+    const ratingText = (root.querySelector('#newann') || root).textContent;
+    const rating = clean((ratingText.match(/Оценки:\s*([^\n]+?)\s*$/m) || [])[1] || '');
+    // отзывы: «who» — ник, «when» — дата и оценка, остальное — строки текста до <br>
+    const reviews = [...root.querySelectorAll('span[class^="container_"]')].map(span => {
+      const b = span.querySelector('b');
+      const who = clean(span.querySelector('b > a')?.textContent || '');
+      let node = b ? b.nextSibling : null;
+      let when = '';
+      for (; node && node.nodeName !== 'BR'; node = node.nextSibling) when += node.textContent;
+      when = clean(when).replace(/^в\s+/, '');
+      const text = [];
+      let line = '';
+      for (; node; node = node.nextSibling) {
+        if (node.nodeName === 'BR') { line = clean(line); if (line) text.push(line); line = ''; }
+        else line += node.textContent;
+      }
+      line = clean(line);
+      if (line) text.push(line);
+      return { who, when, text };
+    });
+    return {
+      cover: coverURL ? coverURL.href : null,
+      annotation,
+      genres,
+      year,
+      size,
+      rating,
+      series: seriesURL ? seriesURL.href : null,
+      reviews
+    };
+  }
+
+  /** BookInfo страницы /b/<id>: память страницы, затем кэш GM на сутки, иначе запрос. */
+  function bookInfo(id) {
+    if (runtime.bookInfoCache.has(id)) return runtime.bookInfoCache.get(id);
+    const promise = (async () => {
+      const key = BOOK_CACHE_PREFIX + id;
+      const cached = readStored(key, null);
+      if (cached && Date.now() - cached.t < LIST_CACHE_MS && cached.info) return cached.info;
+      const html = await httpGetText(new URL('/b/' + id, locationURL.origin).href);
+      const info = parseBookInfo(new DOMParser().parseFromString(html, 'text/html'));
+      try {
+        const index = readStored(BOOK_CACHE_INDEX, []).filter(k => k !== key);
+        index.push(key);
+        while (index.length > BOOK_CACHE_MAX) GM_setValue(index.shift(), null);
+        GM_setValue(key, { t: Date.now(), info });
+        GM_setValue(BOOK_CACHE_INDEX, index);
+      } catch (error) { console.warn('[FDM2] Cannot cache book:', error); }
+      return info;
+    })();
+    runtime.bookInfoCache.set(id, promise);
+    // ошибка не должна застревать в памяти — «ошибка, ещё раз» должна повторить запрос
+    promise.catch(() => runtime.bookInfoCache.delete(id));
+    return promise;
+  }
+
+  /** Кнопка «+ описание» и место под рамку: клик раскрывает/сворачивает обложку, аннотацию и отзывы книги. */
+  function addInfoToggle(id, parent, before) {
+    const btn = element('button', 'fdm-row-btn', '+ описание');
+    btn.type = 'button';
+    btn.title = 'Показать обложку и аннотацию';
+    let box = null;
+    btn.addEventListener('click', async event => {
+      event.preventDefault();
+      if (box && !box.hidden) { box.hidden = true; btn.textContent = '+ описание'; return; }
+      if (box) { box.hidden = false; btn.textContent = '− описание'; return; }
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        box = renderInfo(await bookInfo(id));
+        if (before) parent.insertBefore(box, before); else parent.append(box);
+        btn.textContent = '− описание';
+      } catch (error) {
+        btn.textContent = 'ошибка, ещё раз';
+        btn.title = 'Не удалось загрузить описание: ' + error.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    return btn;
+  }
+
+  /** Рамка описания: только createElement/textContent; src картинки — из parseBookInfo. */
+  function renderInfo(info) {
+    const box = element('div', 'fdm-info');
+    if (info.cover) {
+      const img = element('img', 'fdm-info-cover');
+      img.src = info.cover;
+      img.alt = 'Обложка';
+      img.loading = 'lazy';
+      box.append(img);
+    }
+    const meta = [info.genres.join(', '), info.year && `издание ${info.year} г.`, info.size, info.rating && 'Оценки: ' + info.rating].filter(Boolean);
+    if (meta.length) box.append(element('div', 'fdm-info-meta', meta.join(' · ')));
+    if (info.annotation.length) for (const text of info.annotation) box.append(element('p', '', text));
+    else box.append(element('p', 'fdm-sub-note', 'Аннотации нет.'));
+    if (info.reviews.length) {
+      const list = element('div', 'fdm-reviews');
+      list.hidden = true;
+      for (const review of info.reviews) {
+        const item = element('div', 'fdm-review');
+        item.append(element('b', '', review.who), ' ', element('span', 'fdm-sub-note', review.when));
+        for (const line of review.text) item.append(element('p', '', line));
+        list.append(item);
+      }
+      const toggle = element('button', 'fdm-row-btn', `Отзывы (${info.reviews.length})`);
+      toggle.type = 'button';
+      toggle.addEventListener('click', event => {
+        event.preventDefault();
+        list.hidden = !list.hidden;
+        toggle.textContent = list.hidden ? `Отзывы (${info.reviews.length})` : 'Скрыть отзывы';
+      });
+      box.append(toggle, list);
+    }
+    return box;
   }
 
   /** Книги страницы автора или серии: из кэша на сутки, иначе запрос с повторами. Формат записи — как у extractBooks. */
@@ -729,7 +870,7 @@
         get.type = 'button';
         get.title = 'Скачать эту книгу одним кликом';
         get.addEventListener('click', event => { event.preventDefault(); downloadOne(statRecord(row)); });
-        li.append(get);
+        li.append(get, addInfoToggle(book.id, li));
         ctx.sub.append(li);
       }
     };
