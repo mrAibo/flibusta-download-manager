@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Flibusta Download Manager 2.5.5
+// @name         Flibusta Download Manager 2.5.6
 // @namespace    http://tampermonkey.net/
-// @version      2.5.5
+// @version      2.5.6
 // @description  Batch books with original server filenames by default; optional readable names, remembered folder, retry and resume.
 // @author       Flibusta multidownload contributors; revised edition
 // @license      GPL-3.0-or-later
@@ -44,7 +44,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.5.5';
+  const VERSION = '2.5.6';
   const SETTINGS_KEY = 'fdm2:settings';
   const COLLAPSED_KEY = 'fdm2:collapsed';
   const FOLDER_DB = 'FlibustaDownloadManager';
@@ -143,6 +143,9 @@
     // Блоки статусов: подпись последней записи и номера когда-либо записанных блоков.
     chunkSigs: new Map(),
     writtenChunks: new Set(Array.isArray(state?.chunks) ? state.chunks : []),
+    // Подсказка persist(job): блоки известны только после полного прохода по этому списку заданий.
+    syncedJobs: null,
+    jobIndex: new Map(),
     history: new Map(),
     historyDirty: new Set(),
     historyTimer: null,
@@ -204,15 +207,31 @@
   // statuses live in blocks of STATE_CHUNK jobs (JOBS_KEY:s:n), and only blocks
   // whose content changed are rewritten. One event then writes a header plus
   // one block, however many books are already finished.
-  function persist() {
+  // persist(job...) — подсказка «изменились только эти задания»: сканируется их блок.
+  // Без аргумента, до первого полного прохода или при любом сомнении — полный проход.
+  function persist(...changed) {
     runtime.countsCache = null;
     try {
+      let only = null;
+      if (changed.length && !runtime.jobsDirty && runtime.syncedJobs === state.jobs) {
+        only = new Set();
+        for (const job of changed) {
+          const i = runtime.jobIndex.get(job);
+          if (i === undefined || state.jobs[i] !== job) { only = null; break; }
+          only.add(Math.floor(i / STATE_CHUNK));
+        }
+      }
+      if (!only) {
+        runtime.jobIndex = new Map(state.jobs.map((job, i) => [job, i]));
+        runtime.syncedJobs = state.jobs;
+      }
       if (runtime.jobsDirty) {
         GM_setValue(JOBS_KEY, state.jobs.map(({ id, title, url, name, format, extension }) =>
           ({ id, title, url, name, format, extension })));
         runtime.jobsDirty = false;
       }
       for (let chunk = 0; chunk * STATE_CHUNK < state.jobs.length; chunk++) {
+        if (only && !only.has(chunk)) continue;
         const delta = {};
         const end = Math.min(state.jobs.length, (chunk + 1) * STATE_CHUNK);
         for (let i = chunk * STATE_CHUNK; i < end; i++) {
@@ -236,6 +255,17 @@
       });
     }
     catch (error) { console.error('[FDM2] Cannot save queue:', error); setMessage('Не удалось сохранить очередь: ' + error.message); }
+  }
+
+  // Новая очередь вытесняет старую: её блоки статусов иначе остались бы в хранилище навсегда
+  // (GM_deleteValue не выдан, поэтому затираем null).
+  function dropStatusBlocks() {
+    for (const chunk of runtime.writtenChunks) {
+      try { GM_setValue(JOBS_KEY + ':s:' + chunk, null); }
+      catch (error) { console.warn('[FDM2] Cannot drop old block:', error); }
+    }
+    runtime.chunkSigs.clear();
+    runtime.writtenChunks.clear();
   }
 
   // Accepts the block format of 2.5, the earlier 2.5 header with an inline
@@ -330,6 +360,11 @@
         runtime.historyDirty.delete(key);
       } catch (error) { console.warn('[FDM2] Cannot save history:', error); }
     }
+    // Неудачная запись остаётся в historyDirty; без таймера её повторит только следующий вызов.
+    if (runtime.historyDirty.size > 0 && !runtime.historyTimer) {
+      runtime.historyTimer = setTimeout(flushHistory, HISTORY_FLUSH_MS * 5);
+      runtime.historyTimer.unref?.();
+    }
   }
 
   function clearHistory() {
@@ -385,7 +420,7 @@
   }
 
   function validStoredState(value) {
-    return value && ['2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.4.1', '2.4.2', '2.5.0', '2.5.1', '2.5.2', '2.5.3', '2.5.4', VERSION].includes(value.version) && value.key === PAGE_KEY &&
+    return value && ['2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.4.1', '2.4.2', '2.5.0', '2.5.1', '2.5.2', '2.5.3', '2.5.4', '2.5.5', VERSION].includes(value.version) && value.key === PAGE_KEY &&
       Array.isArray(value.jobs) && value.jobs.length <= MAX_BOOKS &&
       value.jobs.every(job => job && ['queued', 'active', 'done', 'failed', 'skipped'].includes(job.status) &&
         typeof job.url === 'string' && !!sameSiteURL(job.url) &&
@@ -967,31 +1002,46 @@
     if (firstURL.href !== location.href) queue.unshift(firstURL.href);
     let count = 0;
     const unreachable = [];
-    while (queue.length && count < MAX_PAGES - 1) {
-      const url = queue.shift();
-      if (seenURLs.has(url)) continue;
-      seenURLs.add(url);
-      count++;
-      runtime.catalogProgress = { index: count + 1, total: Math.min(MAX_PAGES, count + 1 + queue.length) };
-      setMessage(`Проверяю страницы каталога (найдено ${all.length} книг)`);
-      if (count > 1) await waitFor(opts.delay, signal);
-      let markup;
-      try { markup = await httpGetText(url, signal); }
-      catch (error) {
-        if (error?.name === 'AbortError') throw error;
-        console.warn('[FDM2] Catalogue page failed:', url, error);
-        const page = new URL(url).searchParams.get('page');
-        unreachable.push(page === null ? 'первая' : 'page=' + page);
-        continue;
+    const deferred = [];
+    const guessed = new Set();
+    let secondChance = false;
+    for (;;) {
+      while (queue.length && count < MAX_PAGES - 1) {
+        const url = queue.shift();
+        if (seenURLs.has(url)) continue;
+        seenURLs.add(url);
+        count++;
+        runtime.catalogProgress = { index: count + 1, total: Math.min(MAX_PAGES, count + 1 + queue.length) };
+        setMessage(`Проверяю страницы каталога (найдено ${all.length} книг)`);
+        if (count > 1) await waitFor(opts.delay, signal);
+        let markup;
+        try { markup = await httpGetText(url, signal); }
+        catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          console.warn('[FDM2] Catalogue page failed:', url, error);
+          // Угаданная страница могла быть просто концом каталога: не ошибка, без новых догадок.
+          if (guessed.has(url)) continue;
+          const failed = new URL(url);
+          const page = failed.searchParams.get('page');
+          if (!secondChance) deferred.push(url); else unreachable.push(page === null ? 'первая' : 'page=' + page);
+          // Ссылки на следующие страницы были только на упавшей: пробуем page=N+1 вслепую.
+          failed.searchParams.set('page', String(Number(page || 0) + 1));
+          if (!seenURLs.has(failed.href) && !queue.includes(failed.href)) { guessed.add(failed.href); queue.push(failed.href); }
+          continue;
+        }
+        const doc = new DOMParser().parseFromString(markup, 'text/html');
+        const root = doc.querySelector('div#main') || doc.querySelector('main') || doc.body;
+        const form = getBookForm(root, isAuthor);
+        if (!form) { console.warn('[FDM2] Page without recognized books:', url); continue; }
+        all.push(...extractBooks(form, url));
+        for (const next of discoverPages(root, url)) if (!seenURLs.has(next) && !queue.includes(next)) queue.push(next);
       }
-      const doc = new DOMParser().parseFromString(markup, 'text/html');
-      const root = doc.querySelector('div#main') || doc.querySelector('main') || doc.body;
-      const form = getBookForm(root, isAuthor);
-      if (!form) { console.warn('[FDM2] Page without recognized books:', url); continue; }
-      all.push(...extractBooks(form, url));
-      for (const next of discoverPages(root, url)) if (!seenURLs.has(next) && !queue.includes(next)) queue.push(next);
+      if (secondChance || !deferred.length) break;
+      // Последний шанс: упавшие страницы ещё раз, с тем же разбором и лимитом.
+      secondChance = true;
+      for (const url of deferred) { seenURLs.delete(url); queue.unshift(url); }
     }
-    if (unreachable.length) runtime.prepareNotes.push(`Страницы каталога не загрузились (${unreachable.join(', ')}); книги с них не вошли в очередь.`);
+    if (unreachable.length) runtime.prepareNotes.push(`Страницы каталога не загрузились (${unreachable.join(', ')}); книги с них и со страниц после них могут отсутствовать в очереди.`);
     if (queue.length) runtime.prepareNotes.push(`Достигнут лимит ${MAX_PAGES} страниц: ещё ${queue.length} не проверено.`);
     return all;
   }
@@ -1083,8 +1133,7 @@
         skippedByHistory: alreadyDownloaded, jobs
       };
       runtime.jobsDirty = true;
-      runtime.chunkSigs.clear();
-      runtime.writtenChunks.clear();
+      dropStatusBlocks();
       runtime.cooldownUntil = 0;
       persist();
       runtime.lastStart = 0;
@@ -1171,7 +1220,7 @@
     job.status = 'active';
     job.attempts += 1;
     runtime.active += 1;
-    persist();
+    persist(job);
     render();
     download(job, state.options).then(result => {
       job.status = 'done';
@@ -1206,7 +1255,7 @@
     }).finally(() => {
       runtime.active -= 1;
       runtime.progress.delete(job.id);
-      persist();
+      persist(job);
       render();
       pump();
     });
