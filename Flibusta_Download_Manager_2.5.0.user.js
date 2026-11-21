@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Flibusta Download Manager 2.5.4
+// @name         Flibusta Download Manager 2.5.5
 // @namespace    http://tampermonkey.net/
-// @version      2.5.4
+// @version      2.5.5
 // @description  Batch books with original server filenames by default; optional readable names, remembered folder, retry and resume.
 // @author       Flibusta multidownload contributors; revised edition
 // @license      GPL-3.0-or-later
@@ -12,6 +12,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_notification
 // @connect      *
 // @connect      self
 // @connect      flibusta.is
@@ -43,8 +44,9 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.5.4';
+  const VERSION = '2.5.5';
   const SETTINGS_KEY = 'fdm2:settings';
+  const COLLAPSED_KEY = 'fdm2:collapsed';
   const FOLDER_DB = 'FlibustaDownloadManager';
   const FOLDER_STORE = 'preferences';
   const MAX_PAGES = 30;
@@ -168,13 +170,15 @@
     onlyRecord: null, // книга, которую качает кнопка «⬇» в строке рейтинга или раскрытом списке
     seriesCache: new Map(),
     selectedMode: isBook ? 'all' : 'checked',
-    bookCount: 0
+    bookCount: 0,
+    doneTimes: [] // моменты завершения последних книг — для оценки «осталось»
   };
   let ui;
   window.addEventListener?.('pagehide', () => flushHistory());
   renderInterface();
   runtime.bookBoxes = checkboxEntries();
   runtime.bookCount = pageBooks().length;
+  showDoneMarks();
   attachNativeSelectAll();
   attachBookSelectionListener();
   render();
@@ -281,6 +285,22 @@
 
   function isDownloaded(id, format) { return historyBucket(historyKey(id)).has(id + ':' + format); }
 
+  function wasDownloaded(id) { return FORMATS.some(format => isDownloaded(id, format)); }
+
+  /** Отметка «✓» у скачанных ранее книг. Только класс: текст ссылок и заголовка не меняется, его читают парсеры и имена файлов. */
+  function showDoneMarks() {
+    if (isBook) { title?.classList.toggle('fdm-done', wasDownloaded(locationURL.pathname.match(/\d+/)[0])); return; }
+    for (const link of main.querySelectorAll('a[href]')) {
+      if (link.closest('#fdm-panel')) continue;
+      const id = bookIdentity(link, location.href);
+      if (!id) continue;
+      const done = wasDownloaded(id);
+      link.classList.toggle('fdm-done', done);
+      if (done && !link.title) link.title = 'Уже скачано';
+      else if (!done && link.title === 'Уже скачано') link.removeAttribute('title');
+    }
+  }
+
   // Writes are batched: the in-memory set is the truth (isDownloaded sees
   // unflushed entries); flushHistory() persists it on a timer, pause, stop,
   // end of queue and pagehide.
@@ -324,6 +344,7 @@
     runtime.historyDirty.clear();
     clearTimeout(runtime.historyTimer);
     runtime.historyTimer = null;
+    showDoneMarks();
     setMessage('История скачанного очищена.');
   }
 
@@ -364,7 +385,7 @@
   }
 
   function validStoredState(value) {
-    return value && ['2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.4.1', '2.4.2', '2.5.0', '2.5.1', '2.5.2', '2.5.3', VERSION].includes(value.version) && value.key === PAGE_KEY &&
+    return value && ['2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.4.1', '2.4.2', '2.5.0', '2.5.1', '2.5.2', '2.5.3', '2.5.4', VERSION].includes(value.version) && value.key === PAGE_KEY &&
       Array.isArray(value.jobs) && value.jobs.length <= MAX_BOOKS &&
       value.jobs.every(job => job && ['queued', 'active', 'done', 'failed', 'skipped'].includes(job.status) &&
         typeof job.url === 'string' && !!sameSiteURL(job.url) &&
@@ -534,6 +555,7 @@
       const author = (row.tagName === 'TR' ? authors[authors.length - 1] : authors[0])?.url.href || null;
       const ctx = { id, author, known, open: null, sub: element('ul', 'fdm-sub'), subRows: [], buttons: {} };
       ctx.sub.hidden = true;
+      ctx.sub.addEventListener('change', () => syncSubAll(ctx));
       const row0 = { id, title: bookLink.a.textContent.replace(/\s+/g, ' ').trim(), box };
       get.addEventListener('click', event => { event.preventDefault(); downloadOne(statRecord(row0)); });
       tools.append(get);
@@ -638,6 +660,18 @@
     ctx.subRows = [];
     ctx.sub.replaceChildren();
     if (!books.length) ctx.sub.append(element('li', 'fdm-sub-note', 'Книги не найдены.'));
+    const allItem = element('li');
+    ctx.allBtn = element('button', 'fdm-row-btn fdm-sub-all', 'отметить все');
+    ctx.allBtn.type = 'button';
+    ctx.allBtn.addEventListener('click', event => {
+      event.preventDefault();
+      const on = !ctx.subRows.every(row => row.box.checked);
+      for (const row of ctx.subRows) row.box.checked = on;
+      syncSubAll(ctx);
+      render();
+    });
+    allItem.append(ctx.allBtn);
+    ctx.sub.append(allItem);
     const addItems = list => {
       for (const book of list) {
         const li = element('li');
@@ -669,16 +703,25 @@
       const moreItem = element('li');
       const more = element('button', 'fdm-row-btn', `ещё ${books.length - SUB_LIMIT}`);
       more.type = 'button';
-      more.addEventListener('click', event => { event.preventDefault(); moreItem.remove(); addItems(books.slice(SUB_LIMIT)); refreshBooks(); });
+      more.addEventListener('click', event => { event.preventDefault(); moreItem.remove(); addItems(books.slice(SUB_LIMIT)); syncSubAll(ctx); refreshBooks(); });
       moreItem.append(more);
       ctx.sub.append(moreItem);
     }
+    syncSubAll(ctx);
     refreshBooks();
+  }
+
+  /** Подпись «отметить все / снять отметки» раскрытого списка; без собственных флажков кнопки нет. */
+  function syncSubAll(ctx) {
+    if (!ctx.allBtn) return;
+    ctx.allBtn.parentElement.hidden = !ctx.subRows.length;
+    ctx.allBtn.textContent = ctx.subRows.length && ctx.subRows.every(row => row.box.checked) ? 'снять отметки' : 'отметить все';
   }
 
   function refreshBooks() {
     runtime.bookBoxes = checkboxEntries();
     runtime.bookCount = pageBooks().length;
+    showDoneMarks();
     render();
   }
 
@@ -1015,6 +1058,7 @@
     runtime.message = 'Ищу книги…';
     runtime.prepareNotes = [];
     runtime.catalogProgress = null;
+    runtime.doneTimes = [];
     saveSettings();
     render();
     try {
@@ -1092,9 +1136,35 @@
       flushHistory();
       persist();
       setMessage('Загрузка завершена. Проверьте количество ошибок и журнал.');
+      notifyFinished();
       releaseQueueLock();
     }
     render();
+  }
+
+  /** Системное уведомление об окончании очереди: если вкладка скрыта или книг больше одной. */
+  function notifyFinished() {
+    if (typeof GM_notification !== 'function') return;
+    const counts = countJobs();
+    if (!document.hidden && state.jobs.length < 2) return;
+    try {
+      GM_notification({
+        title: 'Flibusta Download Manager',
+        text: `Скачано ${counts.done} из ${state.jobs.length}` + (counts.failed ? `, ошибок ${counts.failed}` : ''),
+        timeout: 15000,
+        onclick: () => window.focus()
+      });
+    } catch (error) { console.warn('[FDM2] Cannot notify:', error); }
+  }
+
+  /** «Осталось ≈ …» по среднему промежутку между последними завершёнными книгами; null — пока не по чему судить. */
+  function timeLeft(remaining) {
+    const times = runtime.doneTimes;
+    if (times.length < 2 || !remaining) return null;
+    const seconds = Math.round((times[times.length - 1] - times[0]) / (times.length - 1) * remaining / 1000);
+    if (seconds < 60) return 'меньше минуты';
+    const minutes = Math.round(seconds / 60);
+    return minutes < 60 ? `${minutes} мин` : `${Math.floor(minutes / 60)} ч ${minutes % 60} мин`;
   }
 
   function launch(job) {
@@ -1109,6 +1179,8 @@
       job.nameSource = result.source;
       job.error = '';
       markDownloaded(job);
+      runtime.doneTimes = [...runtime.doneTimes.slice(-10), Date.now()];
+      showDoneMarks();
     }).catch(error => {
       const message = error?.message || String(error);
       job.error = message;
@@ -1457,6 +1529,7 @@
   function pause() {
     if (!state) return;
     state.paused = true;
+    runtime.doneTimes = []; // время паузы не должно попасть в оценку «осталось»
     clearTimer();
     flushHistory();
     persist();
@@ -1495,6 +1568,7 @@
     const failed = state.jobs.filter(job => job.status === 'failed');
     if (!failed.length || !await acquireQueueLock()) return;
     state.cancelled = false;
+    runtime.doneTimes = [];
     for (const job of failed) {
       job.status = 'queued'; job.attempts = 0; job.rateHits = 0; job.nextTryAt = 0; job.error = '';
     }
@@ -1815,6 +1889,12 @@
       #fdm-panel button:not(:disabled){cursor:pointer}
       #fdm-panel .fdm-top{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 22px 16px}
       #fdm-panel .fdm-brand{display:flex;align-items:center;gap:12px;min-width:0}
+      #fdm-panel .fdm-top-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+      #fdm-panel .fdm-mini-status{font-size:12px;color:var(--fdm-muted);font-variant-numeric:tabular-nums}
+      #fdm-panel:not(.fdm-collapsed) .fdm-mini-status,#fdm-panel.fdm-collapsed .fdm-select-all{display:none}
+      #fdm-panel.fdm-collapsed>:not(.fdm-top){display:none!important}
+      #fdm-panel.fdm-collapsed .fdm-top{padding-bottom:20px}
+      .fdm-done::after{content:" ✓";color:#2e8b57;font-weight:700}
       #fdm-panel .fdm-brand-copy{min-width:0}
       #fdm-panel .fdm-icon{width:20px;height:20px;flex-shrink:0;display:block}
       #fdm-panel .fdm-mark{display:grid;place-items:center;background:var(--fdm-tint);color:var(--fdm-accent);
@@ -1925,8 +2005,22 @@
       setBookSelection(!boxes.length ? false : !boxes.every(box => box.checked));
     });
     selectionButton.classList.replace('fdm-btn', 'fdm-text-btn');
-    top.append(brand, selectionButton);
+    selectionButton.classList.add('fdm-select-all');
+    const miniStatus = element('span', 'fdm-mini-status');
+    miniStatus.setAttribute('aria-live', 'polite');
+    const collapseButton = button('', () => setCollapsed(!panel.classList.contains('fdm-collapsed')));
+    collapseButton.classList.replace('fdm-btn', 'fdm-text-btn');
+    function setCollapsed(on, save = true) {
+      panel.classList.toggle('fdm-collapsed', on);
+      collapseButton.textContent = on ? 'Развернуть' : 'Свернуть';
+      collapseButton.setAttribute('aria-expanded', String(!on));
+      if (save) { try { GM_setValue(COLLAPSED_KEY, on); } catch (error) { console.warn('[FDM2] Cannot save panel state:', error); } }
+    }
+    const topActions = element('div', 'fdm-top-actions');
+    topActions.append(miniStatus, selectionButton, collapseButton);
+    top.append(brand, topActions);
     panel.append(top);
+    setCollapsed(!!readStored(COLLAPSED_KEY, false), false);
 
     const toolbar = element('div', 'fdm-toolbar');
     const format = select(FORMATS.map(f => [f, f === 'other' ? 'Любой' : f.toUpperCase()]), settings.format);
@@ -2079,7 +2173,7 @@
     message.setAttribute('aria-live', 'polite');
     panel.append(message);
     if (title) title.insertAdjacentElement('afterend', panel); else main.prepend(panel);
-    ui = { panel, format, naming, fallback, verify, allPages, askEach, skipDownloaded, parallel, delay, retries, idle,
+    ui = { panel, miniStatus, collapseButton, format, naming, fallback, verify, allPages, askEach, skipDownloaded, parallel, delay, retries, idle,
       selectedMode, selectionButton, start, folderButton, folderGrantButton, resetFolderButton, clearHistoryButton,
       diagnosticButton, pauseButton, resumeButton, stopButton, retryButton, exportButton,
       queue, jobTitle, stats, bar, fill, current, currentTitle, currentPercent, currentAttempt, currentBar, currentFill, catalog, cooldown, notes, message, errorBox, errorSummary, errorList, folderStatus, folderHint, redirectStatus };
@@ -2127,6 +2221,11 @@
     ui.stats.textContent = `Готово ${counts.done} из ${total} · В очереди ${counts.queued} · Ошибки ${counts.failed}` +
       (state?.skippedByFormat ? ` · Без формата ${state.skippedByFormat}` : '') +
       (state?.skippedByHistory ? ` · Скачано ранее ${state.skippedByHistory}` : '');
+    const left = state && !state.paused ? timeLeft(counts.queued + counts.active) : null;
+    if (left) ui.stats.textContent += ` · Осталось ≈ ${left}`;
+    // Свёрнутая панель показывает только итог: очередь или сколько книг к скачиванию.
+    ui.miniStatus.textContent = total ? `${finished}/${total}` + (counts.active ? ' ⬇' : '') + (counts.failed ? ` · ошибок ${counts.failed}` : '')
+      : `к скачиванию ${displayedTotal}`;
     ui.fill.style.width = finishedPercent + '%';
     ui.bar.setAttribute('aria-valuenow', String(finishedPercent));
     ui.pauseButton.hidden = !state || state.paused || !busy || runtime.preparing;
